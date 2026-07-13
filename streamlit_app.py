@@ -29,13 +29,17 @@ Rules:
 5. Preserve the process logic. Do not invent unsupported business rules.
 6. Use `<br/>` for line breaks inside node labels.
 7. Use simple node IDs containing letters and numbers only.
-8. Avoid Mermaid syntax that commonly causes rendering failures:
-   - no markdown formatting inside labels
-   - no unescaped quotation marks
-   - avoid parentheses in labels where practical
-   - no semicolons
-9. When revising a diagram, return the complete revised Mermaid diagram.
-10. Ensure every referenced node exists and the final diagram is syntactically coherent.
+8. Quote every node label so punctuation is treated as text, for example:
+   - `A["Process owned by Operator (FBO)"]`
+   - `B{"Approved by manager?"}`
+9. Never output an unquoted node label such as `A[Process (FBO)]`.
+10. Inside labels:
+   - use single quotation marks rather than double quotation marks
+   - use `and` instead of ampersands where practical
+   - do not use markdown formatting
+   - do not use semicolons
+11. When revising a diagram, return the complete revised Mermaid diagram.
+12. Ensure every referenced node exists and the final diagram is syntactically coherent.
 """.strip()
 
 DEFAULT_PROCESS = """A weekly process starts by querying newly created products from the last six months. If a product has already been audited in the last six months, take no action. Otherwise add it to an audit candidate list. Check whether it has nutritional data. If yes, run an allergen bolding check and an allergen contradiction check. If no, skip those checks. Run an age restriction check for every candidate. Combine the results, write them to a SharePoint list, and notify the relevant business users."""
@@ -141,7 +145,67 @@ DEFAULT_MODEL = str(
 ).strip() or "gpt-4.1-mini"
 
 
+def quote_mermaid_node_labels(mermaid_code: str) -> str:
+    """
+    Quote common Mermaid node labels so punctuation is treated as text.
+
+    Examples:
+        A[Handled by Operator (FBO)]
+        becomes
+        A["Handled by Operator (FBO)"]
+
+        B{Manager approved?}
+        becomes
+        B{"Manager approved?"}
+
+    Already quoted labels are left unchanged. Double quotation marks inside
+    labels are converted to single quotation marks so they cannot terminate
+    the Mermaid label early.
+    """
+
+    def quote_square(match: re.Match) -> str:
+        node_id = match.group("node_id")
+        label = match.group("label").strip()
+
+        if len(label) >= 2 and label.startswith('"') and label.endswith('"'):
+            return match.group(0)
+
+        safe_label = label.replace('"', "'")
+        return f'{node_id}["{safe_label}"]'
+
+    def quote_decision(match: re.Match) -> str:
+        node_id = match.group("node_id")
+        label = match.group("label").strip()
+
+        if len(label) >= 2 and label.startswith('"') and label.endswith('"'):
+            return match.group(0)
+
+        safe_label = label.replace('"', "'")
+        return f'{node_id}{{"{safe_label}"}}'
+
+    # Standard rectangular nodes: A[Label]
+    square_pattern = re.compile(
+        r'(?P<node_id>\b[A-Za-z][A-Za-z0-9_]*)'
+        r'\[(?P<label>[^\[\]\n]*)\]'
+    )
+
+    # Decision nodes: B{Question?}
+    decision_pattern = re.compile(
+        r'(?P<node_id>\b[A-Za-z][A-Za-z0-9_]*)'
+        r'\{(?P<label>[^{}\n]*)\}'
+    )
+
+    lines = []
+    for line in mermaid_code.splitlines():
+        line = square_pattern.sub(quote_square, line)
+        line = decision_pattern.sub(quote_decision, line)
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
 def clean_mermaid(raw_text: str) -> str:
+    """Clean model output and make common node labels Mermaid-safe."""
     text = (raw_text or "").strip()
 
     fenced = re.search(
@@ -159,7 +223,8 @@ def clean_mermaid(raw_text: str) -> str:
     if start:
         text = text[start.start():].strip()
 
-    return text.replace("\r\n", "\n").strip()
+    text = text.replace("\r\n", "\n").strip()
+    return quote_mermaid_node_labels(text)
 
 
 def generate_mermaid(model: str, prompt: str) -> str:
@@ -257,7 +322,10 @@ def fetch_url_bytes(url: str, timeout: int = 45) -> bytes:
 
 
 def render_diagram_assets(mermaid_code: str) -> tuple[bytes, bytes]:
-    encoded = mermaid_payload(mermaid_code)
+    # Apply the safety pass immediately before rendering as well. This also
+    # protects diagrams loaded from an older session or manually edited code.
+    safe_mermaid_code = quote_mermaid_node_labels(mermaid_code)
+    encoded = mermaid_payload(safe_mermaid_code)
 
     png_url = (
         f"{MERMAID_INK_BASE_URL}/img/{encoded}"
@@ -570,4 +638,3 @@ with st.expander("Built-in AI prompt"):
 st.caption(
     "Python dependencies: streamlit and openai. "
     "The OpenAI key is held in Streamlit Secrets and is not exposed to users."
-)
