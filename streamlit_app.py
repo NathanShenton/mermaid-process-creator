@@ -437,7 +437,6 @@ with left:
                         )
 
                         set_diagram(revised)
-                        st.session_state.follow_up_input = ""
                         refresh_rendered_assets()
                         st.rerun()
 
@@ -571,4 +570,3 @@ with st.expander("Built-in AI prompt"):
 st.caption(
     "Python dependencies: streamlit and openai. "
     "The OpenAI key is held in Streamlit Secrets and is not exposed to users."
-)
