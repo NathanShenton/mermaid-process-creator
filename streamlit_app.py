@@ -1,12 +1,18 @@
-import html
+import base64
 import json
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from textwrap import dedent
 
 import streamlit as st
-import streamlit.components.v1 as components
 from openai import OpenAI
 
+
+# -----------------------------------------------------------------------------
+# Page setup
+# -----------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="AI Process Mapper",
@@ -17,305 +23,377 @@ st.set_page_config(
 SYSTEM_PROMPT = """
 You are an expert business process analyst and Mermaid diagram author.
 
-Your task is to convert a user's process description into valid Mermaid flowchart markdown.
+Convert the user's process description into valid Mermaid flowchart code.
 
 Rules:
-1. Return ONLY the Mermaid code. Do not include markdown fences, commentary, headings, or explanations.
+1. Return only Mermaid code. Do not include markdown fences, headings, notes, or explanations.
 2. Use `flowchart TD` unless the user explicitly requests another direction.
-3. Use short, clear node labels suitable for a business process diagram.
-4. Represent decisions with diamond nodes using `{Question?}` and label outgoing routes, for example `-- Yes -->` and `-- No -->`.
-5. Preserve the logical order and meaning of the user's process. Do not invent unsupported business rules.
-6. Use line breaks inside nodes with `<br/>` rather than literal new lines.
+3. Use short, clear business-friendly node labels.
+4. Use decision diamonds with `{Question?}` and label outgoing routes such as `-- Yes -->` and `-- No -->`.
+5. Preserve the process logic. Do not invent unsupported business rules.
+6. Use `<br/>` for line breaks inside node labels.
 7. Use simple node IDs containing letters and numbers only.
-8. Avoid Mermaid syntax that commonly breaks rendering:
-   - Do not use markdown formatting inside labels.
-   - Avoid unescaped quotation marks.
-   - Avoid parentheses in node text where possible.
-   - Avoid semicolons.
-9. When revising an existing diagram, return the complete revised Mermaid diagram, not just the changed lines.
-10. Ensure every referenced node is defined and the result is syntactically coherent.
+8. Avoid Mermaid syntax that commonly causes rendering failures:
+   - no markdown formatting inside labels
+   - no unescaped quotation marks
+   - avoid parentheses in labels where practical
+   - no semicolons
+9. When revising a diagram, return the complete revised Mermaid diagram.
+10. Ensure every referenced node exists and the final diagram is syntactically coherent.
 """.strip()
 
 DEFAULT_PROCESS = """A weekly process starts by querying newly created products from the last six months. If a product has already been audited in the last six months, take no action. Otherwise add it to an audit candidate list. Check whether it has nutritional data. If yes, run an allergen bolding check and an allergen contradiction check. If no, skip those checks. Run an age restriction check for every candidate. Combine the results, write them to a SharePoint list, and notify the relevant business users."""
 
+MERMAID_INK_BASE_URL = "https://mermaid.ink"
+
+
+# -----------------------------------------------------------------------------
+# Session state
+# -----------------------------------------------------------------------------
 
 def initialise_state() -> None:
     defaults = {
-        "mermaid_code": "",
-        "editor_code": "",
-        "editor_text": "",
-        "history": [],
         "process_description": DEFAULT_PROCESS,
+        "mermaid_code": "",
+        "editor_text": "",
+        "follow_up_input": "",
+        "render_error": "",
+        "png_bytes": None,
+        "pdf_bytes": None,
     }
+
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
+def clear_all() -> None:
+    st.session_state.process_description = DEFAULT_PROCESS
+    st.session_state.mermaid_code = ""
+    st.session_state.editor_text = ""
+    st.session_state.follow_up_input = ""
+    st.session_state.render_error = ""
+    st.session_state.png_bytes = None
+    st.session_state.pdf_bytes = None
+
+
+def reset_editor() -> None:
+    st.session_state.editor_text = st.session_state.mermaid_code
+
+
+initialise_state()
+
+
+# -----------------------------------------------------------------------------
+# Mermaid and OpenAI helpers
+# -----------------------------------------------------------------------------
+
 def clean_mermaid(raw_text: str) -> str:
-    """Remove code fences and surrounding prose that models sometimes add."""
-    text = raw_text.strip()
-    fenced = re.search(r"```(?:mermaid)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    """Remove code fences and any accidental text before the Mermaid diagram."""
+    text = (raw_text or "").strip()
+
+    fenced = re.search(
+        r"```(?:mermaid)?\s*(.*?)```",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     if fenced:
         text = fenced.group(1).strip()
 
-    start = re.search(r"(?im)^\s*(flowchart|graph)\s+(TD|TB|BT|LR|RL)\b", text)
+    start = re.search(
+        r"(?im)^\s*(flowchart|graph)\s+(TD|TB|BT|LR|RL)\b",
+        text,
+    )
     if start:
         text = text[start.start():].strip()
 
     return text.replace("\r\n", "\n").strip()
 
 
-def generate_mermaid(api_key: str, model: str, user_input: str) -> str:
+def generate_mermaid(
+    api_key: str,
+    model: str,
+    prompt: str,
+) -> str:
+    """Call OpenAI and return cleaned Mermaid code."""
     client = OpenAI(api_key=api_key)
+
     response = client.responses.create(
         model=model,
         instructions=SYSTEM_PROMPT,
-        input=user_input,
+        input=prompt,
     )
+
     result = clean_mermaid(response.output_text)
+
     if not result:
-        raise ValueError("The model returned an empty diagram.")
+        raise ValueError("The model returned an empty Mermaid diagram.")
+
+    if not re.match(
+        r"(?is)^\s*(flowchart|graph)\s+(TD|TB|BT|LR|RL)\b",
+        result,
+    ):
+        raise ValueError(
+            "The model response did not begin with a valid Mermaid "
+            "flowchart declaration."
+        )
+
     return result
 
 
-def render_mermaid(mermaid_code: str, height: int = 760) -> None:
-    """Render Mermaid in an isolated Streamlit HTML component with PDF download."""
-    code_json = json.dumps(mermaid_code)
-    component_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-  <style>
-    body {{
-      margin: 0;
-      padding: 12px;
-      font-family: Arial, sans-serif;
-      background: white;
-      color: #222;
-    }}
-    .toolbar {{
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      margin-bottom: 12px;
-      flex-wrap: wrap;
-    }}
-    button {{
-      border: 1px solid #bbb;
-      background: #fff;
-      border-radius: 7px;
-      padding: 8px 12px;
-      cursor: pointer;
-      font-size: 14px;
-    }}
-    button:hover {{ background: #f3f3f3; }}
-    #status {{ font-size: 13px; color: #666; }}
-    #diagram-wrap {{
-      overflow: auto;
-      border: 1px solid #ddd;
-      border-radius: 10px;
-      padding: 20px;
-      min-height: 560px;
-      background: white;
-    }}
-    #diagram svg {{
-      max-width: none !important;
-      height: auto;
-    }}
-    .error {{
-      white-space: pre-wrap;
-      color: #a40000;
-      background: #fff1f1;
-      border: 1px solid #efb4b4;
-      padding: 12px;
-      border-radius: 8px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="toolbar">
-    <button onclick="downloadPDF()">Download PDF</button>
-    <button onclick="fitDiagram()">Fit to width</button>
-    <span id="status"></span>
-  </div>
-  <div id="diagram-wrap">
-    <div id="diagram"></div>
-  </div>
+def mermaid_payload(mermaid_code: str) -> str:
+    """
+    Build the URL-safe payload expected by Mermaid Ink.
 
-<script>
-  const diagramCode = {code_json};
-  mermaid.initialize({{
-    startOnLoad: false,
-    securityLevel: 'loose',
-    theme: 'default',
-    flowchart: {{ htmlLabels: true, curve: 'basis', useMaxWidth: false }}
-  }});
+    Mermaid Ink accepts a base64-encoded JSON object containing the Mermaid
+    code and optional rendering configuration.
+    """
+    payload = {
+        "code": mermaid_code,
+        "mermaid": {
+            "theme": "default",
+            "flowchart": {
+                "htmlLabels": True,
+                "curve": "basis",
+                "useMaxWidth": True,
+            },
+        },
+        "autoSync": True,
+        "updateDiagram": True,
+    }
 
-  async function drawDiagram() {{
-    const target = document.getElementById('diagram');
-    try {{
-      const result = await mermaid.render('generated-mermaid-diagram', diagramCode);
-      target.innerHTML = result.svg;
-      if (result.bindFunctions) result.bindFunctions(target);
-      fitDiagram();
-    }} catch (error) {{
-      target.innerHTML = '<div class="error"><strong>Mermaid rendering error</strong>\n\n' +
-        String(error).replaceAll('<', '&lt;').replaceAll('>', '&gt;') + '</div>';
-    }}
-  }}
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
-  function fitDiagram() {{
-    const svg = document.querySelector('#diagram svg');
-    if (!svg) return;
-    svg.style.width = '100%';
-    svg.style.maxWidth = '100%';
-    svg.style.height = 'auto';
-  }}
-
-  async function downloadPDF() {{
-    const status = document.getElementById('status');
-    const diagram = document.getElementById('diagram');
-    const svg = diagram.querySelector('svg');
-    if (!svg) {{
-      status.textContent = 'No rendered diagram is available.';
-      return;
-    }}
-
-    status.textContent = 'Creating PDF...';
-    try {{
-      const canvas = await html2canvas(diagram, {{
-        backgroundColor: '#ffffff',
-        scale: 2,
-        useCORS: true,
-        logging: false
-      }});
-
-      const {{ jsPDF }} = window.jspdf;
-      const imgData = canvas.toDataURL('image/png');
-      const margin = 10;
-      const landscape = canvas.width >= canvas.height;
-      const pdf = new jsPDF({{
-        orientation: landscape ? 'landscape' : 'portrait',
-        unit: 'mm',
-        format: 'a4'
-      }});
-
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const maxWidth = pageWidth - margin * 2;
-      const maxHeight = pageHeight - margin * 2;
-      const ratio = Math.min(maxWidth / canvas.width, maxHeight / canvas.height);
-      const imgWidth = canvas.width * ratio;
-      const imgHeight = canvas.height * ratio;
-      const x = (pageWidth - imgWidth) / 2;
-      const y = (pageHeight - imgHeight) / 2;
-
-      pdf.addImage(imgData, 'PNG', x, y, imgWidth, imgHeight, undefined, 'FAST');
-      pdf.save('process-diagram.pdf');
-      status.textContent = 'PDF downloaded.';
-    }} catch (error) {{
-      status.textContent = 'PDF creation failed: ' + String(error);
-    }}
-  }}
-
-  drawDiagram();
-</script>
-</body>
-</html>
-"""
-    components.html(component_html, height=height, scrolling=True)
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-initialise_state()
+def fetch_url_bytes(url: str, timeout: int = 45) -> bytes:
+    """Fetch binary content using only the Python standard library."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 AI-Process-Mapper/1.0",
+            "Accept": "*/*",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            content = response.read()
+            content_type = response.headers.get("Content-Type", "")
+
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Rendering service returned HTTP {response.status}."
+                )
+
+            if not content:
+                raise RuntimeError("Rendering service returned an empty response.")
+
+            if "text/html" in content_type.lower():
+                preview = content.decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(
+                    "Rendering service returned an HTML error page: "
+                    + preview
+                )
+
+            return content
+
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")[:800]
+        raise RuntimeError(
+            f"Rendering service returned HTTP {exc.code}: {error_body}"
+        ) from exc
+
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            "Could not contact the Mermaid rendering service. "
+            f"Details: {exc.reason}"
+        ) from exc
 
 
-def reset_editor_to_rendered() -> None:
-    """Reset the editor before Streamlit instantiates the text-area widget."""
-    st.session_state.editor_text = st.session_state.mermaid_code
-    st.session_state.editor_code = st.session_state.mermaid_code
+def render_diagram_assets(mermaid_code: str) -> tuple[bytes, bytes]:
+    """
+    Render the Mermaid diagram as PNG and PDF through Mermaid Ink.
 
+    This does not use Streamlit HTML components, browser JavaScript,
+    Mermaid CDN scripts, html2canvas, or jsPDF.
+    """
+    encoded = mermaid_payload(mermaid_code)
+
+    png_url = (
+        f"{MERMAID_INK_BASE_URL}/img/{encoded}"
+        "?type=png&bgColor=white&width=1800"
+    )
+    pdf_url = f"{MERMAID_INK_BASE_URL}/pdf/{encoded}?fit"
+
+    png = fetch_url_bytes(png_url)
+    pdf = fetch_url_bytes(pdf_url)
+
+    if not png.startswith(b"\x89PNG"):
+        raise RuntimeError(
+            "The rendering service did not return a valid PNG image. "
+            "The Mermaid syntax may be invalid."
+        )
+
+    if not pdf.startswith(b"%PDF"):
+        raise RuntimeError(
+            "The rendering service did not return a valid PDF file."
+        )
+
+    return png, pdf
+
+
+def set_diagram(mermaid_code: str) -> None:
+    """Store new Mermaid code and clear old rendered files."""
+    cleaned = clean_mermaid(mermaid_code)
+
+    st.session_state.mermaid_code = cleaned
+    st.session_state.editor_text = cleaned
+    st.session_state.png_bytes = None
+    st.session_state.pdf_bytes = None
+    st.session_state.render_error = ""
+
+
+def refresh_rendered_assets() -> None:
+    """Render the currently stored Mermaid code."""
+    if not st.session_state.mermaid_code.strip():
+        st.session_state.render_error = "There is no Mermaid code to render."
+        st.session_state.png_bytes = None
+        st.session_state.pdf_bytes = None
+        return
+
+    try:
+        png, pdf = render_diagram_assets(st.session_state.mermaid_code)
+        st.session_state.png_bytes = png
+        st.session_state.pdf_bytes = pdf
+        st.session_state.render_error = ""
+    except Exception as exc:
+        st.session_state.png_bytes = None
+        st.session_state.pdf_bytes = None
+        st.session_state.render_error = str(exc)
+
+
+# -----------------------------------------------------------------------------
+# Sidebar
+# -----------------------------------------------------------------------------
 
 st.title("AI Process Mapper")
-st.caption("Describe a process, generate Mermaid, refine it with AI, edit the code directly, and download the rendered diagram as PDF.")
+st.caption(
+    "Describe a process, generate Mermaid code, revise it with AI, "
+    "edit it directly, and download the visual as a PDF."
+)
 
 with st.sidebar:
     st.header("Settings")
+
     api_key = st.text_input(
         "OpenAI API key",
         type="password",
         placeholder="sk-...",
-        help="The key is used only for API calls during this browser session and is not written to disk by this app.",
+        help=(
+            "The key is used only for OpenAI API calls during this "
+            "browser session. It is not written to a file by this app."
+        ),
     )
+
     model = st.text_input(
         "OpenAI model",
         value="gpt-4.1-mini",
-        help="Change this if your OpenAI project uses a different text model.",
+        help="Change this only if your OpenAI project uses another model.",
     )
+
     st.divider()
-    if st.button("Clear diagram and history", use_container_width=True):
-        st.session_state.mermaid_code = ""
-        st.session_state.editor_code = ""
-        st.session_state.editor_text = ""
-        st.session_state.history = []
-        st.rerun()
+
+    st.button(
+        "Clear diagram and history",
+        use_container_width=True,
+        on_click=clear_all,
+    )
+
+    st.caption(
+        "Diagram rendering is provided by the public Mermaid Ink service. "
+        "The Mermaid text is sent to that service to create the image and PDF."
+    )
+
+
+# -----------------------------------------------------------------------------
+# Main app
+# -----------------------------------------------------------------------------
 
 left, right = st.columns([0.9, 1.4], gap="large")
 
 with left:
     st.subheader("1. Describe the process")
-    st.session_state.process_description = st.text_area(
+
+    st.text_area(
         "Process description",
-        value=st.session_state.process_description,
-        height=250,
+        key="process_description",
+        height=240,
         label_visibility="collapsed",
     )
 
-    if st.button("Generate process diagram", type="primary", use_container_width=True):
+    if st.button(
+        "Generate process diagram",
+        type="primary",
+        use_container_width=True,
+    ):
         if not api_key.strip():
             st.error("Enter your OpenAI API key first.")
         elif not st.session_state.process_description.strip():
             st.error("Enter a process description first.")
+        elif not model.strip():
+            st.error("Enter an OpenAI model name.")
         else:
             with st.spinner("Generating Mermaid diagram..."):
                 try:
                     prompt = (
-                        "Create a Mermaid process diagram from this description:\n\n"
+                        "Create a Mermaid process flowchart from this "
+                        "description:\n\n"
                         + st.session_state.process_description.strip()
                     )
-                    generated = generate_mermaid(api_key.strip(), model.strip(), prompt)
-                    st.session_state.mermaid_code = generated
-                    st.session_state.editor_code = generated
-                    st.session_state.editor_text = generated
-                    st.session_state.history = [
-                        {"role": "user", "content": st.session_state.process_description.strip()},
-                        {"role": "assistant", "content": generated},
-                    ]
+
+                    generated = generate_mermaid(
+                        api_key=api_key.strip(),
+                        model=model.strip(),
+                        prompt=prompt,
+                    )
+
+                    set_diagram(generated)
+                    refresh_rendered_assets()
                     st.rerun()
+
                 except Exception as exc:
                     st.error(f"OpenAI request failed: {exc}")
 
     if st.session_state.mermaid_code:
         st.subheader("2. Ask for a change")
-        follow_up = st.text_area(
+
+        st.text_area(
             "Describe the change",
-            placeholder="For example: Add a manager approval after the audit results are combined. If rejected, return the item for rework.",
-            height=120,
             key="follow_up_input",
+            placeholder=(
+                "For example: Add a manager approval after the results "
+                "are combined. If rejected, return the item for rework."
+            ),
+            height=110,
+            label_visibility="collapsed",
         )
 
-        if st.button("Apply AI change", use_container_width=True):
+        if st.button(
+            "Apply AI change",
+            use_container_width=True,
+        ):
             if not api_key.strip():
                 st.error("Enter your OpenAI API key first.")
-            elif not follow_up.strip():
+            elif not st.session_state.follow_up_input.strip():
                 st.error("Describe the change you want to make.")
             else:
-                with st.spinner("Updating diagram..."):
+                with st.spinner("Updating Mermaid diagram..."):
                     try:
                         revision_prompt = dedent(
                             f"""
@@ -324,67 +402,152 @@ with left:
                             {st.session_state.mermaid_code}
 
                             Apply this requested change:
-                            {follow_up.strip()}
+
+                            {st.session_state.follow_up_input.strip()}
 
                             Return the complete revised Mermaid diagram only.
                             """
                         ).strip()
-                        revised = generate_mermaid(api_key.strip(), model.strip(), revision_prompt)
-                        st.session_state.mermaid_code = revised
-                        st.session_state.editor_code = revised
-                        st.session_state.editor_text = revised
-                        st.session_state.history.extend(
-                            [
-                                {"role": "user", "content": follow_up.strip()},
-                                {"role": "assistant", "content": revised},
-                            ]
+
+                        revised = generate_mermaid(
+                            api_key=api_key.strip(),
+                            model=model.strip(),
+                            prompt=revision_prompt,
                         )
+
+                        set_diagram(revised)
+                        st.session_state.follow_up_input = ""
+                        refresh_rendered_assets()
                         st.rerun()
+
                     except Exception as exc:
                         st.error(f"OpenAI request failed: {exc}")
 
         st.subheader("3. Edit Mermaid directly")
-        edited_code = st.text_area(
-            "Mermaid markdown",
-            height=330,
+
+        st.text_area(
+            "Mermaid code",
             key="editor_text",
+            height=320,
             label_visibility="collapsed",
         )
-        col_apply, col_reset = st.columns(2)
-        with col_apply:
-            if st.button("Render edited Mermaid", use_container_width=True):
-                cleaned = clean_mermaid(edited_code)
+
+        apply_col, reset_col = st.columns(2)
+
+        with apply_col:
+            if st.button(
+                "Render edited Mermaid",
+                use_container_width=True,
+            ):
+                cleaned = clean_mermaid(st.session_state.editor_text)
+
                 if not cleaned:
                     st.error("The Mermaid editor is empty.")
                 else:
-                    # The text area already owns editor_text during this run.
-                    # Updating it here would raise StreamlitAPIException.
-                    st.session_state.editor_code = cleaned
                     st.session_state.mermaid_code = cleaned
+                    st.session_state.png_bytes = None
+                    st.session_state.pdf_bytes = None
+                    st.session_state.render_error = ""
+
+                    with st.spinner("Rendering edited diagram..."):
+                        refresh_rendered_assets()
+
                     st.rerun()
-        with col_reset:
+
+        with reset_col:
             st.button(
                 "Reset editor",
                 use_container_width=True,
-                on_click=reset_editor_to_rendered,
+                on_click=reset_editor,
             )
 
         st.download_button(
-            "Download Mermaid markdown",
+            "Download Mermaid code",
             data=st.session_state.mermaid_code,
             file_name="process-diagram.mmd",
             mime="text/plain",
             use_container_width=True,
+            on_click="ignore",
         )
 
 with right:
     st.subheader("Diagram")
-    if st.session_state.mermaid_code:
-        render_mermaid(st.session_state.mermaid_code)
-    else:
+
+    if not st.session_state.mermaid_code:
         st.info("Generate a diagram to display it here.")
+
+    else:
+        if (
+            st.session_state.png_bytes is None
+            and not st.session_state.render_error
+        ):
+            with st.spinner("Rendering diagram..."):
+                refresh_rendered_assets()
+
+        if st.session_state.render_error:
+            st.error("The diagram could not be rendered.")
+            st.code(
+                st.session_state.render_error,
+                language="text",
+            )
+
+            st.info(
+                "Review the Mermaid code for syntax problems, edit it on "
+                "the left, and select **Render edited Mermaid**."
+            )
+
+            if st.button(
+                "Try rendering again",
+                use_container_width=True,
+            ):
+                st.session_state.render_error = ""
+                refresh_rendered_assets()
+                st.rerun()
+
+        elif st.session_state.png_bytes:
+            st.image(
+                st.session_state.png_bytes,
+                caption="Rendered Mermaid process diagram",
+                width="stretch",
+            )
+
+            download_col1, download_col2 = st.columns(2)
+
+            with download_col1:
+                st.download_button(
+                    "Download PNG",
+                    data=st.session_state.png_bytes,
+                    file_name="process-diagram.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    on_click="ignore",
+                )
+
+            with download_col2:
+                st.download_button(
+                    "Download PDF",
+                    data=st.session_state.pdf_bytes,
+                    file_name="process-diagram.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    on_click="ignore",
+                )
+
+            if st.button(
+                "Re-render diagram",
+                use_container_width=True,
+            ):
+                st.session_state.png_bytes = None
+                st.session_state.pdf_bytes = None
+                st.session_state.render_error = ""
+                refresh_rendered_assets()
+                st.rerun()
+
 
 with st.expander("Built-in AI prompt"):
     st.code(SYSTEM_PROMPT, language="text")
 
-st.caption("Community Cloud requirements: streamlit and openai. Mermaid and PDF libraries are loaded in the browser from public CDNs.")
+st.caption(
+    "Python dependencies: streamlit and openai. "
+    "No Streamlit HTML component or browser-side Mermaid JavaScript is used."
+)
