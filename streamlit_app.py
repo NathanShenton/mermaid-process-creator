@@ -234,6 +234,13 @@ def render_mermaid(mermaid_code: str, height: int = 760) -> None:
 
 initialise_state()
 
+
+def reset_editor_to_rendered() -> None:
+    """Reset the editor before Streamlit instantiates the text-area widget."""
+    st.session_state.editor_text = st.session_state.mermaid_code
+    st.session_state.editor_code = st.session_state.mermaid_code
+
+
 st.title("AI Process Mapper")
 st.caption("Describe a process, generate Mermaid, refine it with AI, edit the code directly, and download the rendered diagram as PDF.")
 
@@ -350,15 +357,17 @@ with left:
                 if not cleaned:
                     st.error("The Mermaid editor is empty.")
                 else:
+                    # The text area already owns editor_text during this run.
+                    # Updating it here would raise StreamlitAPIException.
                     st.session_state.editor_code = cleaned
-                    st.session_state.editor_text = cleaned
                     st.session_state.mermaid_code = cleaned
                     st.rerun()
         with col_reset:
-            if st.button("Reset editor", use_container_width=True):
-                st.session_state.editor_code = st.session_state.mermaid_code
-                st.session_state.editor_text = st.session_state.mermaid_code
-                st.rerun()
+            st.button(
+                "Reset editor",
+                use_container_width=True,
+                on_click=reset_editor_to_rendered,
+            )
 
         st.download_button(
             "Download Mermaid markdown",
