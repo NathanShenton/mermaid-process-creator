@@ -388,4 +388,3 @@ with st.expander("Built-in AI prompt"):
     st.code(SYSTEM_PROMPT, language="text")
 
 st.caption("Community Cloud requirements: streamlit and openai. Mermaid and PDF libraries are loaded in the browser from public CDNs.")
-
