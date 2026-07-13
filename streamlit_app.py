@@ -570,3 +570,4 @@ with st.expander("Built-in AI prompt"):
 st.caption(
     "Python dependencies: streamlit and openai. "
     "The OpenAI key is held in Streamlit Secrets and is not exposed to users."
+)
