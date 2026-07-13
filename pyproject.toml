@@ -1,11 +1,12 @@
 [project]
-name = "blank-app-template"
+name = "mermaid-process-builder"
 version = "0.1.0"
-description = "A simple Streamlit app template."
+description = "A Streamlit app that converts process descriptions into Mermaid flowcharts using OpenAI."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "streamlit>=1.59.1",
+"streamlit>=1.59.1",
+"openai>=1.0.0",
 ]
 
 [tool.uv]
