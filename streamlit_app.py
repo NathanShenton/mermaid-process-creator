@@ -1,18 +1,14 @@
 import base64
+import hmac
 import json
 import re
 import urllib.error
-import urllib.parse
 import urllib.request
 from textwrap import dedent
 
 import streamlit as st
 from openai import OpenAI
 
-
-# -----------------------------------------------------------------------------
-# Page setup
-# -----------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="AI Process Mapper",
@@ -47,12 +43,9 @@ DEFAULT_PROCESS = """A weekly process starts by querying newly created products 
 MERMAID_INK_BASE_URL = "https://mermaid.ink"
 
 
-# -----------------------------------------------------------------------------
-# Session state
-# -----------------------------------------------------------------------------
-
 def initialise_state() -> None:
     defaults = {
+        "authenticated": False,
         "process_description": DEFAULT_PROCESS,
         "mermaid_code": "",
         "editor_text": "",
@@ -81,15 +74,74 @@ def reset_editor() -> None:
     st.session_state.editor_text = st.session_state.mermaid_code
 
 
+def sign_out() -> None:
+    clear_all()
+    st.session_state.authenticated = False
+
+
 initialise_state()
 
 
-# -----------------------------------------------------------------------------
-# Mermaid and OpenAI helpers
-# -----------------------------------------------------------------------------
+def get_required_secret(name: str) -> str:
+    try:
+        value = str(st.secrets[name]).strip()
+    except (KeyError, FileNotFoundError):
+        st.error(
+            f"Missing Streamlit secret: `{name}`. "
+            "Add it in Manage app → Settings → Secrets."
+        )
+        st.stop()
+
+    if not value:
+        st.error(
+            f"Streamlit secret `{name}` is empty. "
+            "Add a valid value in Manage app → Settings → Secrets."
+        )
+        st.stop()
+
+    return value
+
+
+def show_login() -> None:
+    st.title("AI Process Mapper")
+    st.caption("Enter the shared access password to continue.")
+
+    with st.form("login_form", clear_on_submit=False):
+        entered_password = st.text_input(
+            "Access password",
+            type="password",
+        )
+        submitted = st.form_submit_button(
+            "Sign in",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        expected_password = get_required_secret("APP_PASSWORD")
+
+        if hmac.compare_digest(
+            entered_password.encode("utf-8"),
+            expected_password.encode("utf-8"),
+        ):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+
+if not st.session_state.authenticated:
+    show_login()
+    st.stop()
+
+
+OPENAI_API_KEY = get_required_secret("OPENAI_API_KEY")
+DEFAULT_MODEL = str(
+    st.secrets.get("OPENAI_MODEL", "gpt-4.1-mini")
+).strip() or "gpt-4.1-mini"
+
 
 def clean_mermaid(raw_text: str) -> str:
-    """Remove code fences and any accidental text before the Mermaid diagram."""
     text = (raw_text or "").strip()
 
     fenced = re.search(
@@ -110,13 +162,8 @@ def clean_mermaid(raw_text: str) -> str:
     return text.replace("\r\n", "\n").strip()
 
 
-def generate_mermaid(
-    api_key: str,
-    model: str,
-    prompt: str,
-) -> str:
-    """Call OpenAI and return cleaned Mermaid code."""
-    client = OpenAI(api_key=api_key)
+def generate_mermaid(model: str, prompt: str) -> str:
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
     response = client.responses.create(
         model=model,
@@ -142,12 +189,6 @@ def generate_mermaid(
 
 
 def mermaid_payload(mermaid_code: str) -> str:
-    """
-    Build the URL-safe payload expected by Mermaid Ink.
-
-    Mermaid Ink accepts a base64-encoded JSON object containing the Mermaid
-    code and optional rendering configuration.
-    """
     payload = {
         "code": mermaid_code,
         "mermaid": {
@@ -172,7 +213,6 @@ def mermaid_payload(mermaid_code: str) -> str:
 
 
 def fetch_url_bytes(url: str, timeout: int = 45) -> bytes:
-    """Fetch binary content using only the Python standard library."""
     request = urllib.request.Request(
         url,
         headers={
@@ -217,12 +257,6 @@ def fetch_url_bytes(url: str, timeout: int = 45) -> bytes:
 
 
 def render_diagram_assets(mermaid_code: str) -> tuple[bytes, bytes]:
-    """
-    Render the Mermaid diagram as PNG and PDF through Mermaid Ink.
-
-    This does not use Streamlit HTML components, browser JavaScript,
-    Mermaid CDN scripts, html2canvas, or jsPDF.
-    """
     encoded = mermaid_payload(mermaid_code)
 
     png_url = (
@@ -249,7 +283,6 @@ def render_diagram_assets(mermaid_code: str) -> tuple[bytes, bytes]:
 
 
 def set_diagram(mermaid_code: str) -> None:
-    """Store new Mermaid code and clear old rendered files."""
     cleaned = clean_mermaid(mermaid_code)
 
     st.session_state.mermaid_code = cleaned
@@ -260,7 +293,6 @@ def set_diagram(mermaid_code: str) -> None:
 
 
 def refresh_rendered_assets() -> None:
-    """Render the currently stored Mermaid code."""
     if not st.session_state.mermaid_code.strip():
         st.session_state.render_error = "There is no Mermaid code to render."
         st.session_state.png_bytes = None
@@ -278,10 +310,6 @@ def refresh_rendered_assets() -> None:
         st.session_state.render_error = str(exc)
 
 
-# -----------------------------------------------------------------------------
-# Sidebar
-# -----------------------------------------------------------------------------
-
 st.title("AI Process Mapper")
 st.caption(
     "Describe a process, generate Mermaid code, revise it with AI, "
@@ -291,21 +319,13 @@ st.caption(
 with st.sidebar:
     st.header("Settings")
 
-    api_key = st.text_input(
-        "OpenAI API key",
-        type="password",
-        placeholder="sk-...",
-        help=(
-            "The key is used only for OpenAI API calls during this "
-            "browser session. It is not written to a file by this app."
-        ),
-    )
-
     model = st.text_input(
         "OpenAI model",
-        value="gpt-4.1-mini",
-        help="Change this only if your OpenAI project uses another model.",
+        value=DEFAULT_MODEL,
+        help="Change this only if the configured OpenAI project supports another model.",
     )
+
+    st.success("Access authorised")
 
     st.divider()
 
@@ -315,15 +335,22 @@ with st.sidebar:
         on_click=clear_all,
     )
 
+    st.button(
+        "Sign out",
+        use_container_width=True,
+        on_click=sign_out,
+    )
+
+    st.caption(
+        "The OpenAI API key is stored securely in Streamlit Secrets "
+        "and is never shown in the app."
+    )
+
     st.caption(
         "Diagram rendering is provided by the public Mermaid Ink service. "
         "The Mermaid text is sent to that service to create the image and PDF."
     )
 
-
-# -----------------------------------------------------------------------------
-# Main app
-# -----------------------------------------------------------------------------
 
 left, right = st.columns([0.9, 1.4], gap="large")
 
@@ -342,9 +369,7 @@ with left:
         type="primary",
         use_container_width=True,
     ):
-        if not api_key.strip():
-            st.error("Enter your OpenAI API key first.")
-        elif not st.session_state.process_description.strip():
+        if not st.session_state.process_description.strip():
             st.error("Enter a process description first.")
         elif not model.strip():
             st.error("Enter an OpenAI model name.")
@@ -358,7 +383,6 @@ with left:
                     )
 
                     generated = generate_mermaid(
-                        api_key=api_key.strip(),
                         model=model.strip(),
                         prompt=prompt,
                     )
@@ -388,9 +412,7 @@ with left:
             "Apply AI change",
             use_container_width=True,
         ):
-            if not api_key.strip():
-                st.error("Enter your OpenAI API key first.")
-            elif not st.session_state.follow_up_input.strip():
+            if not st.session_state.follow_up_input.strip():
                 st.error("Describe the change you want to make.")
             else:
                 with st.spinner("Updating Mermaid diagram..."):
@@ -410,7 +432,6 @@ with left:
                         ).strip()
 
                         revised = generate_mermaid(
-                            api_key=api_key.strip(),
                             model=model.strip(),
                             prompt=revision_prompt,
                         )
@@ -549,5 +570,4 @@ with st.expander("Built-in AI prompt"):
 
 st.caption(
     "Python dependencies: streamlit and openai. "
-    "No Streamlit HTML component or browser-side Mermaid JavaScript is used."
-)
+    "The OpenAI key is held in Streamlit Secrets and is not exposed to users."
