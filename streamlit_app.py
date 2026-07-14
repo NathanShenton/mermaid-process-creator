@@ -38,8 +38,12 @@ Rules:
    - use `and` instead of ampersands where practical
    - do not use markdown formatting
    - do not use semicolons
-11. When revising a diagram, return the complete revised Mermaid diagram.
-12. Ensure every referenced node exists and the final diagram is syntactically coherent.
+11. Define every node ID exactly once.
+12. Never define a node first as a rectangle and later redefine it as a decision.
+13. Decision nodes must use the diamond shape on their first and only definition, for example `A2{"Order found?<br/>Automation Suitable"}`.
+14. Do not use the lowercase word `end` as a node ID. Use `EndNode["End"]` instead.
+15. When revising a diagram, return the complete revised Mermaid diagram.
+16. Ensure every referenced node exists and the final diagram is syntactically coherent.
 """.strip()
 
 DEFAULT_PROCESS = """A weekly process starts by querying newly created products from the last six months. If a product has already been audited in the last six months, take no action. Otherwise add it to an audit candidate list. Check whether it has nutritional data. If yes, run an allergen bolding check and an allergen contradiction check. If no, skip those checks. Run an age restriction check for every candidate. Combine the results, write them to a SharePoint list, and notify the relevant business users."""
@@ -204,6 +208,54 @@ def quote_mermaid_node_labels(mermaid_code: str) -> str:
     return "\n".join(lines)
 
 
+def normalise_mermaid_structure(mermaid_code: str) -> str:
+    """
+    Remove duplicate standalone node declarations and avoid Mermaid's reserved
+    lowercase `end` identifier.
+
+    AI-generated diagrams sometimes define a node twice, for example:
+
+        A2["Check whether order exists"]
+        A2{"Order found?"}
+
+    Mermaid treats the second declaration as a syntax error. This function
+    keeps the final declaration for each node ID because it usually contains
+    the intended decision shape.
+    """
+
+    lines = mermaid_code.splitlines()
+
+    node_definition = re.compile(
+        r'^\s*(?P<node_id>[A-Za-z][A-Za-z0-9_]*)\s*'
+        r'(?P<shape>\[(?P<square>.*)\]|\{(?P<decision>.*)\})\s*$'
+    )
+
+    last_definition_index: dict[str, int] = {}
+
+    for index, line in enumerate(lines):
+        match = node_definition.match(line)
+        if match:
+            last_definition_index[match.group("node_id")] = index
+
+    output_lines: list[str] = []
+
+    for index, line in enumerate(lines):
+        match = node_definition.match(line)
+
+        if match and last_definition_index.get(match.group("node_id")) != index:
+            continue
+
+        line = re.sub(
+            r'(?P<arrow>-->|---|-.->|==>)\s*end\b',
+            r'\g<arrow> EndNode["End"]',
+            line,
+        )
+
+        output_lines.append(line)
+
+    return "\n".join(output_lines)
+
+
 def clean_mermaid(raw_text: str) -> str:
     """Clean model output and make common node labels Mermaid-safe."""
     text = (raw_text or "").strip()
@@ -224,6 +276,7 @@ def clean_mermaid(raw_text: str) -> str:
         text = text[start.start():].strip()
 
     text = text.replace("\r\n", "\n").strip()
+    text = normalise_mermaid_structure(text)
     return quote_mermaid_node_labels(text)
 
 
@@ -324,7 +377,8 @@ def fetch_url_bytes(url: str, timeout: int = 45) -> bytes:
 def render_diagram_assets(mermaid_code: str) -> tuple[bytes, bytes]:
     # Apply the safety pass immediately before rendering as well. This also
     # protects diagrams loaded from an older session or manually edited code.
-    safe_mermaid_code = quote_mermaid_node_labels(mermaid_code)
+    safe_mermaid_code = normalise_mermaid_structure(mermaid_code)
+    safe_mermaid_code = quote_mermaid_node_labels(safe_mermaid_code)
     encoded = mermaid_payload(safe_mermaid_code)
 
     png_url = (
