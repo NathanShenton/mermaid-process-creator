@@ -61,6 +61,7 @@ def initialise_state() -> None:
         "render_error": "",
         "png_bytes": None,
         "pdf_bytes": None,
+        "diagram_theme": "Standard",
     }
 
     for key, value in defaults.items():
@@ -80,6 +81,13 @@ def clear_all() -> None:
 
 def reset_editor() -> None:
     st.session_state.editor_text = st.session_state.mermaid_code
+
+
+def invalidate_rendered_assets() -> None:
+    """Force the diagram to be regenerated when its visual style changes."""
+    st.session_state.png_bytes = None
+    st.session_state.pdf_bytes = None
+    st.session_state.render_error = ""
 
 
 def sign_out() -> None:
@@ -306,6 +314,119 @@ def generate_mermaid(model: str, prompt: str) -> str:
     return result
 
 
+def apply_diagram_theme(
+    mermaid_code: str,
+    theme_name: str,
+) -> str:
+    """
+    Apply colours according to each node's role in the process.
+
+    Colourful mode uses:
+    - green for starting nodes
+    - blue for ordinary process steps
+    - yellow for decision diamonds
+    - red for ending nodes
+
+    Automation wording inside labels does not affect styling.
+    """
+    if theme_name != "Colourful by node type":
+        return mermaid_code
+
+    node_definition = re.compile(
+        r'^\s*(?P<node_id>[A-Za-z][A-Za-z0-9_]*)\s*'
+        r'(?P<shape>\[(?P<square>.*)\]|\{(?P<decision>.*)\})\s*$'
+    )
+
+    node_ids: set[str] = set()
+    decision_nodes: set[str] = set()
+
+    for line in mermaid_code.splitlines():
+        match = node_definition.match(line)
+        if not match:
+            continue
+
+        node_id = match.group("node_id")
+        node_ids.add(node_id)
+
+        if match.group("decision") is not None:
+            decision_nodes.add(node_id)
+
+    incoming: dict[str, int] = {node_id: 0 for node_id in node_ids}
+    outgoing: dict[str, int] = {node_id: 0 for node_id in node_ids}
+
+    # Capture the source and destination IDs for common Mermaid arrows,
+    # including arrows with labels such as: A -- Yes --> B
+    edge_pattern = re.compile(
+        r'(?P<source>\b[A-Za-z][A-Za-z0-9_]*\b)'
+        r'(?:\s*--[^>\n]*-->\s*|\s*-->\s*|\s*-.->\s*|\s*==>\s*)'
+        r'(?P<target>\b[A-Za-z][A-Za-z0-9_]*\b)'
+    )
+
+    for line in mermaid_code.splitlines():
+        for match in edge_pattern.finditer(line):
+            source = match.group("source")
+            target = match.group("target")
+
+            if source in outgoing:
+                outgoing[source] += 1
+            if target in incoming:
+                incoming[target] += 1
+
+    start_nodes = {
+        node_id
+        for node_id in node_ids
+        if incoming.get(node_id, 0) == 0
+    }
+
+    end_nodes = {
+        node_id
+        for node_id in node_ids
+        if outgoing.get(node_id, 0) == 0
+    }
+
+    # Start/end colours take priority over the ordinary process colour.
+    ordinary_nodes = (
+        node_ids
+        - decision_nodes
+        - start_nodes
+        - end_nodes
+    )
+
+    # A node can technically be both a decision and an end. Keep ending-node
+    # styling as the final priority because it communicates completion.
+    decision_only_nodes = decision_nodes - start_nodes - end_nodes
+
+    style_lines = [
+        "",
+        "%% Automatically applied node-type theme",
+        "classDef startNode fill:#DCFCE7,stroke:#16A34A,color:#14532D,stroke-width:2px",
+        "classDef processNode fill:#DBEAFE,stroke:#2563EB,color:#1E3A8A,stroke-width:2px",
+        "classDef decisionNode fill:#FEF3C7,stroke:#D97706,color:#78350F,stroke-width:2px",
+        "classDef endNode fill:#FEE2E2,stroke:#DC2626,color:#7F1D1D,stroke-width:2px",
+    ]
+
+    if ordinary_nodes:
+        style_lines.append(
+            f"class {','.join(sorted(ordinary_nodes))} processNode"
+        )
+
+    if decision_only_nodes:
+        style_lines.append(
+            f"class {','.join(sorted(decision_only_nodes))} decisionNode"
+        )
+
+    if start_nodes:
+        style_lines.append(
+            f"class {','.join(sorted(start_nodes))} startNode"
+        )
+
+    if end_nodes:
+        style_lines.append(
+            f"class {','.join(sorted(end_nodes))} endNode"
+        )
+
+    return mermaid_code.rstrip() + "\n" + "\n".join(style_lines)
+
 def mermaid_payload(mermaid_code: str) -> str:
     payload = {
         "code": mermaid_code,
@@ -374,11 +495,18 @@ def fetch_url_bytes(url: str, timeout: int = 45) -> bytes:
         ) from exc
 
 
-def render_diagram_assets(mermaid_code: str) -> tuple[bytes, bytes]:
+def render_diagram_assets(
+    mermaid_code: str,
+    theme_name: str,
+) -> tuple[bytes, bytes]:
     # Apply the safety pass immediately before rendering as well. This also
     # protects diagrams loaded from an older session or manually edited code.
     safe_mermaid_code = normalise_mermaid_structure(mermaid_code)
     safe_mermaid_code = quote_mermaid_node_labels(safe_mermaid_code)
+    safe_mermaid_code = apply_diagram_theme(
+        safe_mermaid_code,
+        theme_name,
+    )
     encoded = mermaid_payload(safe_mermaid_code)
 
     png_url = (
@@ -422,7 +550,10 @@ def refresh_rendered_assets() -> None:
         return
 
     try:
-        png, pdf = render_diagram_assets(st.session_state.mermaid_code)
+        png, pdf = render_diagram_assets(
+            st.session_state.mermaid_code,
+            st.session_state.diagram_theme,
+        )
         st.session_state.png_bytes = png
         st.session_state.pdf_bytes = pdf
         st.session_state.render_error = ""
@@ -445,6 +576,21 @@ with st.sidebar:
         "OpenAI model",
         value=DEFAULT_MODEL,
         help="Change this only if the configured OpenAI project supports another model.",
+    )
+
+    st.selectbox(
+        "Diagram style",
+        options=[
+            "Standard",
+            "Colourful by node type",
+        ],
+        key="diagram_theme",
+        help=(
+            "Standard uses Mermaid's normal appearance. Colourful by node type "
+            "uses green for starting nodes, blue for ordinary process steps, "
+            "yellow for decisions, and red for ending nodes."
+        ),
+        on_change=invalidate_rendered_assets,
     )
 
     st.success("Access authorised")
@@ -614,6 +760,12 @@ with left:
 
 with right:
     st.subheader("Diagram")
+
+    if st.session_state.diagram_theme == "Colourful by node type":
+        st.caption(
+            "Colour key: green = start · blue = process step · "
+            "yellow = decision · red = end"
+        )
 
     if not st.session_state.mermaid_code:
         st.info("Generate a diagram to display it here.")
