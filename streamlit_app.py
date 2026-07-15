@@ -1,9 +1,11 @@
 import base64
 import hmac
+import io
 import json
 import re
 import urllib.error
 import urllib.request
+import wave
 from textwrap import dedent
 
 import streamlit as st
@@ -49,6 +51,9 @@ Rules:
 DEFAULT_PROCESS = """A weekly process starts by querying newly created products from the last six months. If a product has already been audited in the last six months, take no action. Otherwise add it to an audit candidate list. Check whether it has nutritional data. If yes, run an allergen bolding check and an allergen contradiction check. If no, skip those checks. Run an age restriction check for every candidate. Combine the results, write them to a SharePoint list, and notify the relevant business users."""
 
 MERMAID_INK_BASE_URL = "https://mermaid.ink"
+MAX_AUDIO_SECONDS = 5 * 60
+MAX_AUDIO_UPLOAD_MB = 20
+TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 
 
 def initialise_state() -> None:
@@ -62,6 +67,8 @@ def initialise_state() -> None:
         "png_bytes": None,
         "pdf_bytes": None,
         "diagram_theme": "Standard",
+        "pending_transcript": "",
+        "audio_status": "",
     }
 
     for key, value in defaults.items():
@@ -77,6 +84,8 @@ def clear_all() -> None:
     st.session_state.render_error = ""
     st.session_state.png_bytes = None
     st.session_state.pdf_bytes = None
+    st.session_state.pending_transcript = ""
+    st.session_state.audio_status = ""
 
 
 def reset_editor() -> None:
@@ -262,6 +271,54 @@ def normalise_mermaid_structure(mermaid_code: str) -> str:
         output_lines.append(line)
 
     return "\n".join(output_lines)
+
+
+def get_wav_duration_seconds(audio_bytes: bytes) -> float:
+    """Return the duration of a WAV recording without sending it anywhere."""
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            frame_count = wav_file.getnframes()
+            frame_rate = wav_file.getframerate()
+            if frame_rate <= 0:
+                raise ValueError("The WAV file has an invalid sample rate.")
+            return frame_count / float(frame_rate)
+    except (wave.Error, EOFError) as exc:
+        raise ValueError(
+            "The selected audio is not a valid WAV file. "
+            "Please record audio in the app or upload a WAV file."
+        ) from exc
+
+
+def transcribe_wav(audio_file) -> str:
+    """Validate and transcribe a WAV recording with a strict five-minute limit."""
+    audio_bytes = audio_file.getvalue()
+    if not audio_bytes:
+        raise ValueError("The selected audio file is empty.")
+
+    duration_seconds = get_wav_duration_seconds(audio_bytes)
+    if duration_seconds > MAX_AUDIO_SECONDS:
+        raise ValueError(
+            f"The recording is {duration_seconds / 60:.1f} minutes long. "
+            "The maximum permitted length is 5 minutes."
+        )
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    filename = getattr(audio_file, "name", None) or "recording.wav"
+    if not filename.lower().endswith(".wav"):
+        filename = "recording.wav"
+
+    transcription_file = io.BytesIO(audio_bytes)
+    transcription_file.name = filename
+
+    result = client.audio.transcriptions.create(
+        model=TRANSCRIPTION_MODEL,
+        file=transcription_file,
+    )
+
+    transcript = (result.text or "").strip()
+    if not transcript:
+        raise ValueError("The transcription service returned no text.")
+    return transcript
 
 
 def clean_mermaid(raw_text: str) -> str:
@@ -622,8 +679,80 @@ with st.sidebar:
 
 left, right = st.columns([0.9, 1.4], gap="large")
 
+if st.session_state.pending_transcript:
+    st.session_state.process_description = st.session_state.pending_transcript
+    st.session_state.pending_transcript = ""
+
 with left:
     st.subheader("1. Describe the process")
+
+    with st.expander("Record or upload the process as audio"):
+        st.caption(
+            "Record up to five minutes, or upload a WAV file. "
+            "The audio is checked locally before being sent for transcription."
+        )
+
+        recorded_audio = st.audio_input(
+            "Record process description",
+            sample_rate=16000,
+            key="process_audio_recording",
+        )
+
+        uploaded_audio = st.file_uploader(
+            "Or upload a WAV recording",
+            type=["wav"],
+            max_upload_size=MAX_AUDIO_UPLOAD_MB,
+            key="process_audio_upload",
+            help=(
+                "Only WAV files are accepted so the app can reliably verify "
+                "the duration before sending the audio to OpenAI."
+            ),
+        )
+
+        selected_audio = recorded_audio or uploaded_audio
+
+        if selected_audio is not None:
+            try:
+                selected_duration = get_wav_duration_seconds(selected_audio.getvalue())
+                st.audio(selected_audio)
+                st.caption(
+                    f"Audio length: {selected_duration / 60:.1f} minutes "
+                    f"({selected_duration:.0f} seconds)."
+                )
+                if selected_duration > MAX_AUDIO_SECONDS:
+                    st.error(
+                        "This recording is longer than five minutes and "
+                        "cannot be transcribed."
+                    )
+            except ValueError as exc:
+                st.error(str(exc))
+                selected_duration = None
+        else:
+            selected_duration = None
+
+        if st.button(
+            "Transcribe audio into process description",
+            use_container_width=True,
+            disabled=(
+                selected_audio is None
+                or selected_duration is None
+                or selected_duration > MAX_AUDIO_SECONDS
+            ),
+        ):
+            with st.spinner("Transcribing audio..."):
+                try:
+                    transcript = transcribe_wav(selected_audio)
+                    st.session_state.pending_transcript = transcript
+                    st.session_state.audio_status = (
+                        "Audio transcribed successfully. Review and edit the "
+                        "process description below before generating the diagram."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Audio transcription failed: {exc}")
+
+    if st.session_state.audio_status:
+        st.success(st.session_state.audio_status)
 
     st.text_area(
         "Process description",
@@ -843,5 +972,6 @@ with st.expander("Built-in AI prompt"):
 
 st.caption(
     "Python dependencies: streamlit and openai. "
-    "The OpenAI key is held in Streamlit Secrets and is not exposed to users."
+    "The OpenAI key is held in Streamlit Secrets and is not exposed to users. "
+    "Audio recordings are limited to five minutes before transcription."
 )
